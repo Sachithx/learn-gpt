@@ -130,8 +130,8 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # weight sharing scheme
-        self.transformer.wpe.weight = self.transformer.wte.weight
-
+        self.transformer.wte.weight = self.lm_head.weight
+        
         # init params
         self.apply(self._init_weights)
 
@@ -264,9 +264,11 @@ class DataLoaderLite:
     entire text file in memory and serves the data in chunks of B * T tokens.
     """
 
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         # load the tokens from disk and store in the memory
         with open('input.txt', 'r') as f:
@@ -278,7 +280,7 @@ class DataLoaderLite:
         print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
         # state
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         """
@@ -292,9 +294,10 @@ class DataLoaderLite:
         x = (buff[:-1]).view(B, T)
         y = (buff[1:]).view(B, T)
 
-        self.current_position += B * T
-        if self.current_position + B * T > len(self.tokens):
-            self.current_position = 0
+        self.current_position += B * T * self.num_processes
+
+        if self.current_position + (B * T * self.num_processes) > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
         
         return x, y
 
@@ -304,21 +307,59 @@ The main script to train the GPT model. This script loads the data from disk, cr
 using the DataLoaderLite class. The model is trained using the AdamW optimizer and the cross-entropy loss.
 """
 
+# torchrun --standalone --nproc_per_node=4 train_gpt.py
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
+import torch.distributed as dist
+import os
+
+
+ddp = int(os.environ.get('RANK', -1)) != -1
+if ddp:
+    assert torch.cuda.is_available(), "distributed training requires CUDA"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # only the master process will print
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"using device: {device}")
+
+
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(1337)
 
-train_loader = DataLoaderLite(B=24, T=1024)
+total_batch_size = 524288 # 2^19 tokens in total
+B = 16 # micro batch size
+T = 1024 # sequence length
 
-# ---- GPU memory optimization ----
+assert total_batch_size % (B * T * ddp_world_size) == 0, "the total batch size must be divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+
 torch.set_float32_matmul_precision('high') 
 
-# get logits
-model = GPT(GPTConfig(vocab_size=50304))    
+# ---- GPU memory optimization ---- create model
+model = GPT(GPTConfig(vocab_size=50304))
 model.to('cuda')
-
-# ---- GPU memory optimization ----
 model = torch.compile(model)
+
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
+
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 10
@@ -344,35 +385,70 @@ def get_lr(it):
 # Optimize!!
 # ---- GPU memory optimization ----
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device='cuda')
-# ---- GPU memory optimization ----
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device='cuda')
 
+
+# ---- GPU memory optimization ----
 for step in range(50):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x = x.to('cuda')
-    y = y.to('cuda')
     optimizer.zero_grad()
-    # ---- GPU memory optimization ----
-    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-
-    loss.backward()
-    # ---- GPU memory optimization ----
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to('cuda'), y.to('cuda')
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+        loss.backward()
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # determine learning rate
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
-    dt = (t1 - t0) * 1000 # in milliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {step:4d} | loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | time: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.0f}")
+    dt = t1 - t0
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+    tokens_per_sec = tokens_processed / dt
+    if master_process:
+        print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | time: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.0f}")
 
 
+if ddp:
+    destroy_process_group()
+    
 import sys; sys.exit(0)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # --------------------------------
 
