@@ -56,7 +56,7 @@ After training, you can generate text by providing a prefix and using the traine
 
 ## License
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+This project is licensed under the Apache License. See the LICENSE file for details.
 
 ## Acknowledgments
 
