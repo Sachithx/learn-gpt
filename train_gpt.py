@@ -4,8 +4,14 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 
+# --------------------------------
 
 class CausalSelfAttention(nn.Module):
+    """
+    A vanilla multi-head masked self-attention layer with a projection at the end.
+    It is possible to use torch.nn.MultiheadAttention here but I am including an
+    explicit implementation here to show that there is nothing too scary here.
+    """
     
     def __init__(self, config):
         super().__init__()
@@ -16,6 +22,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
         # regularization
         self.n_head = config.n_head
@@ -25,6 +32,10 @@ class CausalSelfAttention(nn.Module):
                              .view(1, 1, config.block_size, config.block_size))
         
     def forward(self, x):
+        """
+        In the forward pass, we get in a tensor of shape (B, T, n_embd) where B is the batch size, T is the
+        length of the sequence and n_embd is the embedding dimension. We need to perform the following steps:
+        """
         B, T, C = x.size() # batch size, sequence length, embedding size (n_embd)
 
         # calculate query, key, values for all heads in batch
@@ -44,12 +55,16 @@ class CausalSelfAttention(nn.Module):
         
         
 class MLP(nn.Module):
+    """
+    A simple class for an MLP. It just combines a linear layer with a GELU activation function.
+    """
 
     def __init__(self, config):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, config.n_embd * 4)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(config.n_embd * 4, config.n_embd) 
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -59,6 +74,10 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
+    """
+    This class implements a single block of the GPT model, with a layer norm, a multi-head self-attention
+    mechanism, and a feed-forward network.
+    """
 
     def __init__(self, config):
         super().__init__()
@@ -75,6 +94,10 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
+    """
+    A class to hold the configuration of the GPT model. This is just a simple dataclass to hold
+    the hyperparameters and other variables we need to instantiate the model.
+    """
 
     block_size: int = 1024
     vocab_size: int = 50257
@@ -83,6 +106,10 @@ class GPTConfig:
     n_embd: int = 768
 
 class GPT(nn.Module):
+    """
+    The actual GPT model. This class implements the forward pass of the model. It uses the GPTConfig
+    class to configure the model. The model consists of an embedding layer, followed by a number of blocks.
+    """
 
     def __init__(self, config: GPTConfig):
         super().__init__()
@@ -96,7 +123,33 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+        # weight sharing scheme
+        self.transformer.wpe.weight = self.transformer.wte.weight
+
+        # init params
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        """
+        Initialize the weights of the model. This is a custom initialization scheme that is used in the GPT model.
+        """
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+
+    def forward(self, idx, targets=None):
+        """
+        The forward pass of the model. The input is a tensor of shape (B, T) where B is the batch size and T is the
+        length of the sequence. The model also takes an optional target tensor which is used to calculate the loss.
+        """
+
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward, model block size is exhausted. Got {T} tokens, but configured for {self.config.block_size}"
 
@@ -113,11 +166,17 @@ class GPT(nn.Module):
         # forward the final layer norm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # shape (B, T, vocab_size)
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
-        """Loads pretrained GPT-2 model weights form huggingface"""
+        """
+        Loads pretrained GPT-2 model weights form huggingface 
+        """
+        
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
@@ -164,16 +223,83 @@ class GPT(nn.Module):
 
         return model
 
+# --------------------------------
 
-# ----------
-num_return_sequences = 5
-max_length = 30
+import tiktoken
 
-# load the model
-model = GPT.from_pretrained('gpt2')
-model.eval()
+class DataLoaderLite:
+    """
+    A class to load the data from disk and serve it in batches. This is a simple implementation that loads the
+    entire text file in memory and serves the data in chunks of B * T tokens.
+    """
+
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        # load the tokens from disk and store in the memory
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+
+        # state
+        self.current_position = 0
+
+    def next_batch(self):
+        """
+        Get the next batch of data. The data is returned as a tuple of two tensors (x, y) where x is the input
+        and y is the target. Both x and y have the shape (B, T) where B is the batch size and T is the length
+        of the sequence.
+        """
+
+        B, T = self.B, self.T
+        buff = self.tokens[self.current_position:self.current_position + B * T + 1]
+        x = (buff[:-1]).view(B, T)
+        y = (buff[1:]).view(B, T)
+
+        self.current_position += B * T
+        if self.current_position + B * T > len(self.tokens):
+            self.current_position = 0
+        
+        return x, y
+
+# --------------------------------
+"""
+The main script to train the GPT model. This script loads the data from disk, creates the model, and trains it
+using the DataLoaderLite class. The model is trained using the AdamW optimizer and the cross-entropy loss.
+"""
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(1337)
+
+train_loader = DataLoaderLite(B=4, T=32)
+
+# get logits
+model = GPT(GPTConfig())    
 model.to('cuda')
-print(model)
+# logits, loss = model(x, y)
+
+# Optimize!!
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x = x.to('cuda')
+    y = y.to('cuda')
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
+
+
+import sys; sys.exit(0)
+
+# --------------------------------
 
 # prefix tokens
 import tiktoken
@@ -187,11 +313,11 @@ x = tokens.to('cuda')
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 while x.size(1) < max_length:
-    print(f"Generating {x.size(1)} / {max_length}")
+    # print(f"Generating {x.size(1)} / {max_length}")
     # forward the model to get logits
     with torch.no_grad():
         logits = model(x) # (B, T, vocab_size)
-        print(logits.size())
+        # print(logits.size())
         # take the logits at the last position: (B, vocab_size)
         logits = logits[:, -1, :] # (B, vocab_size)
         # get the probabilities
@@ -211,6 +337,6 @@ while x.size(1) < max_length:
 for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
-    print(f"Generated {i}: {decoded}")
+    print(f">>: {decoded}")
 
-# ----------
+# -----------   end of file ----------------
