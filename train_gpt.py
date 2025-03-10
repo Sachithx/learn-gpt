@@ -5,6 +5,8 @@ from torch.nn import functional as F
 import math
 import time
 import inspect
+import wandb
+
 
 # --------------------------------
 
@@ -351,6 +353,8 @@ train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp
 
 torch.set_float32_matmul_precision('high') 
 
+
+
 # ---- GPU memory optimization ---- create model
 model = GPT(GPTConfig(vocab_size=50304))
 model.to('cuda')
@@ -364,6 +368,23 @@ max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 10
 max_steps = 50
+
+n_steps = 1000
+
+# Initialize wandb
+wandb.init(project="gpt-training", config={
+    "batch_size": B,
+    "sequence_length": T,
+    "learning_rate": max_lr,
+    "weight_decay": 0.1,
+    "gradient_accumulation_steps": grad_accum_steps,
+    "num_steps": n_steps,
+    "optimizer": "AdamW",
+    "device": device,
+    "model_architecture": "GPT",
+    "ddp_world_size": ddp_world_size
+})
+
 
 def get_lr(it):
     """
@@ -389,7 +410,7 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4,
 
 
 # ---- GPU memory optimization ----
-for step in range(50):
+for step in range(n_steps):
     t0 = time.time()
     optimizer.zero_grad()
     loss_accum = 0.0
@@ -418,7 +439,16 @@ for step in range(50):
     tokens_per_sec = tokens_processed / dt
     if master_process:
         print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | time: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.0f}")
+        wandb.log({
+            "step": step,
+            "loss": loss_accum.item(),
+            "learning_rate": lr,
+            "gradient_norm": norm,
+            "tokens_per_sec": tokens_per_sec,
+            "step_time": dt
+        })
 
+wandb.finish()
 
 if ddp:
     destroy_process_group()
